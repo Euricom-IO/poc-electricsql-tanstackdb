@@ -3,7 +3,12 @@ import { createRoot } from 'react-dom/client';
 import { RouterProvider, createRouter } from '@tanstack/react-router';
 import { routeTree } from './routeTree.gen';
 import { auth } from './lib/auth';
+import { initSyncEngine } from './lib/syncEngine';
 import './styles.css';
+
+// Drain any writes queued in a previous (offline) session and start listening
+// for connectivity changes.
+initSyncEngine();
 
 const router = createRouter({
   routeTree,

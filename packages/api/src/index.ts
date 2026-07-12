@@ -5,6 +5,7 @@ import type { AppEnv } from './auth';
 import { authRoutes } from './routes/auth';
 import { todoRoutes } from './routes/todos';
 import { userRoutes } from './routes/users';
+import { eventRoutes } from './routes/events';
 
 const app = new Hono<AppEnv>();
 
@@ -12,10 +13,14 @@ app.use('*', logger());
 app.use('/api/*', cors());
 
 app.get('/health', (c) => c.json({ status: 'ok' }));
+// Same check under /api so it is reachable through the web dev-server proxy
+// (which only forwards /api/*) — used by the client sync engine's heartbeat.
+app.get('/api/health', (c) => c.json({ status: 'ok' }));
 
 app.route('/api/auth', authRoutes);
 app.route('/api/todos', todoRoutes);
 app.route('/api/users', userRoutes);
+app.route('/api/events', eventRoutes);
 
 const port = Number(process.env.API_PORT ?? 3000);
 console.log(`🚀 API listening on http://localhost:${port}`);

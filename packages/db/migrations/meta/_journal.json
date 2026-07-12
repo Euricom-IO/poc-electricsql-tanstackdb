@@ -8,6 +8,13 @@
       "when": 1783845181005,
       "tag": "0000_short_jackpot",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1783858532315,
+      "tag": "0001_cooing_ronan",
+      "breakpoints": true
     }
   ]
 }

@@ -1,8 +1,8 @@
 import { createCollection } from '@tanstack/react-db';
 import { electricCollectionOptions } from '@tanstack/electric-db-collection';
 import type { Role } from '@app/db/types';
-import { api } from '@/lib/api';
-import { ELECTRIC_URL } from '@/lib/electric';
+import { submitCommand } from '@/lib/syncEngine';
+import { ELECTRIC_URL, electricFetch, ELECTRIC_BACKOFF } from '@/lib/electric';
 
 /**
  * A user row as it arrives from the ElectricSQL shape stream. The shape selects
@@ -27,8 +27,10 @@ export type UserItem = UserRow & {
 
 /**
  * Users as an optimistic TanStack DB collection backed by ElectricSQL (admin
- * page). Reads stream live from the Electric shape API; writes go through the
- * existing API, which returns the Postgres `txid` for sync matching.
+ * page). Reads stream live from the Electric shape API; writes are captured as
+ * durable, offline-tolerant commands by the sync engine, which posts them to
+ * /api/events and resolves each handler with the Postgres `txid` for sync
+ * matching.
  */
 export const userCollection = createCollection(
   electricCollectionOptions<UserItem>({
@@ -37,35 +39,34 @@ export const userCollection = createCollection(
       url: ELECTRIC_URL,
       // Exclude pin_hash — never sync credential hashes to the client.
       params: { table: 'users', columns: ['id', 'name', 'role', 'created_at'] },
+      // Resume the read stream immediately on reconnect (see lib/electric.ts).
+      fetchClient: electricFetch,
+      backoffOptions: ELECTRIC_BACKOFF,
     },
     getKey: (user) => user.id,
-    onInsert: async ({ transaction }) => {
+    onInsert: ({ transaction }) => {
       const user = transaction.mutations[0].modified;
-      const { txid } = await api<{ txid: number }>('/api/users', {
-        method: 'POST',
-        body: JSON.stringify({
-          id: user.id,
-          name: user.name,
-          pin: user.pin,
-          role: user.role,
-        }),
+      return submitCommand({
+        entity: 'user',
+        op: 'insert',
+        payload: { id: user.id, name: user.name, pin: user.pin, role: user.role },
       });
-      return { txid };
     },
-    onUpdate: async ({ transaction }) => {
+    onUpdate: ({ transaction }) => {
       const { original, changes } = transaction.mutations[0];
-      const { txid } = await api<{ txid: number }>(`/api/users/${original.id}`, {
-        method: 'PATCH',
-        body: JSON.stringify(changes),
+      return submitCommand({
+        entity: 'user',
+        op: 'update',
+        payload: { id: original.id, ...changes },
       });
-      return { txid };
     },
-    onDelete: async ({ transaction }) => {
+    onDelete: ({ transaction }) => {
       const { original } = transaction.mutations[0];
-      const { txid } = await api<{ txid: number }>(`/api/users/${original.id}`, {
-        method: 'DELETE',
+      return submitCommand({
+        entity: 'user',
+        op: 'delete',
+        payload: { id: original.id },
       });
-      return { txid };
     },
   }),
 );

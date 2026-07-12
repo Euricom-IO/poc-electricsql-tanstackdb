@@ -2,6 +2,7 @@ import { createFileRoute, Link, Outlet, redirect, useNavigate } from '@tanstack/
 import { LogOut } from 'lucide-react';
 import { auth } from '@/lib/auth';
 import { Button } from '@/components/ui/button';
+import { SyncStatus } from '@/components/SyncStatus';
 
 export const Route = createFileRoute('/_authed')({
   beforeLoad: ({ context }) => {
@@ -42,6 +43,7 @@ function AuthedLayout() {
             )}
           </nav>
           <div className="flex items-center gap-3">
+            <SyncStatus />
             <span className="text-sm text-muted-foreground">
               {user?.name}
               {auth.isAdmin && ' (admin)'}

@@ -1,10 +1,12 @@
 import { Hono } from 'hono';
-import { and, desc, eq } from 'drizzle-orm';
+import { desc, eq } from 'drizzle-orm';
 import { db, todos } from '@app/db';
 import type { AppEnv } from '../auth';
 import { authMiddleware } from '../middleware/auth';
 import { toTodo } from '../mappers';
 import { getTxid } from '../txid';
+import { applyTodoInsert, applyTodoUpdate, applyTodoDelete } from '../services/todos';
+import { ServiceError } from '../services/errors';
 
 export const todoRoutes = new Hono<AppEnv>();
 
@@ -23,40 +25,28 @@ todoRoutes.get('/', async (c) => {
 todoRoutes.post('/', async (c) => {
   const user = c.get('user');
   const body = await c.req.json<{ id?: string; title?: string }>();
-  const title = (body.title ?? '').trim();
-  if (!title) {
-    return c.json({ error: 'title is required' }, 400);
+  try {
+    // Wrap the write in a transaction so we can hand back its txid for Electric
+    // sync matching. The mutation itself lives in the shared todo service.
+    const { row, txid } = await db.transaction(async (tx) => {
+      const txid = await getTxid(tx);
+      const row = await applyTodoInsert(tx, user, body);
+      return { row, txid };
+    });
+    return c.json({ ...toTodo(row), txid }, 201);
+  } catch (e) {
+    if (e instanceof ServiceError) return c.json({ error: e.message }, e.status);
+    throw e;
   }
-  // Wrap the write in a transaction so we can hand back its txid for Electric
-  // sync matching. A client-supplied id is honored (like the users route) so
-  // optimistic Electric inserts keep a stable key.
-  const { row, txid } = await db.transaction(async (tx) => {
-    const txid = await getTxid(tx);
-    const [row] = await tx
-      .insert(todos)
-      .values({ userId: user.id, title, ...(body.id ? { id: body.id } : {}) })
-      .returning();
-    return { row: row!, txid };
-  });
-  return c.json({ ...toTodo(row), txid }, 201);
 });
 
 todoRoutes.patch('/:id', async (c) => {
   const user = c.get('user');
   const id = c.req.param('id');
   const body = await c.req.json<{ title?: string; completed?: boolean }>();
-
-  const patch: Partial<{ title: string; completed: boolean }> = {};
-  if (typeof body.title === 'string') patch.title = body.title.trim();
-  if (typeof body.completed === 'boolean') patch.completed = body.completed;
-
   const { row, txid } = await db.transaction(async (tx) => {
     const txid = await getTxid(tx);
-    const [row] = await tx
-      .update(todos)
-      .set(patch)
-      .where(and(eq(todos.id, id), eq(todos.userId, user.id)))
-      .returning();
+    const row = await applyTodoUpdate(tx, user, { id, ...body });
     return { row, txid };
   });
   if (!row) {
@@ -70,10 +60,7 @@ todoRoutes.delete('/:id', async (c) => {
   const id = c.req.param('id');
   const { row, txid } = await db.transaction(async (tx) => {
     const txid = await getTxid(tx);
-    const [row] = await tx
-      .delete(todos)
-      .where(and(eq(todos.id, id), eq(todos.userId, user.id)))
-      .returning();
+    const row = await applyTodoDelete(tx, user, { id });
     return { row, txid };
   });
   if (!row) {

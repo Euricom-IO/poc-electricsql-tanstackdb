@@ -1,7 +1,7 @@
 import { createCollection } from '@tanstack/react-db';
 import { electricCollectionOptions } from '@tanstack/electric-db-collection';
-import { api } from '@/lib/api';
-import { ELECTRIC_URL } from '@/lib/electric';
+import { submitCommand } from '@/lib/syncEngine';
+import { ELECTRIC_URL, electricFetch, ELECTRIC_BACKOFF } from '@/lib/electric';
 
 /**
  * A todo row as it arrives from the ElectricSQL shape stream: raw Postgres
@@ -17,9 +17,10 @@ export type TodoRow = {
 
 /**
  * Todos as an optimistic TanStack DB collection backed by ElectricSQL. Reads
- * stream live from the Electric shape API (the whole `todos` table); writes go
- * through the existing API, which returns the Postgres `txid` so Electric can
- * match each optimistic mutation against the synced row.
+ * stream live from the Electric shape API (the whole `todos` table); writes are
+ * captured as durable, offline-tolerant commands by the sync engine, which posts
+ * them to /api/events and resolves each handler with the Postgres `txid` so
+ * Electric can match the optimistic mutation against the synced row.
  */
 export const todoCollection = createCollection(
   electricCollectionOptions<TodoRow>({
@@ -27,30 +28,34 @@ export const todoCollection = createCollection(
     shapeOptions: {
       url: ELECTRIC_URL,
       params: { table: 'todos' },
+      // Resume the read stream immediately on reconnect (see lib/electric.ts).
+      fetchClient: electricFetch,
+      backoffOptions: ELECTRIC_BACKOFF,
     },
     getKey: (row) => row.id,
-    onInsert: async ({ transaction }) => {
+    onInsert: ({ transaction }) => {
       const row = transaction.mutations[0].modified;
-      const { txid } = await api<{ txid: number }>('/api/todos', {
-        method: 'POST',
-        body: JSON.stringify({ id: row.id, title: row.title }),
+      return submitCommand({
+        entity: 'todo',
+        op: 'insert',
+        payload: { id: row.id, title: row.title },
       });
-      return { txid };
     },
-    onUpdate: async ({ transaction }) => {
+    onUpdate: ({ transaction }) => {
       const { original, changes } = transaction.mutations[0];
-      const { txid } = await api<{ txid: number }>(`/api/todos/${original.id}`, {
-        method: 'PATCH',
-        body: JSON.stringify({ title: changes.title, completed: changes.completed }),
+      return submitCommand({
+        entity: 'todo',
+        op: 'update',
+        payload: { id: original.id, title: changes.title, completed: changes.completed },
       });
-      return { txid };
     },
-    onDelete: async ({ transaction }) => {
+    onDelete: ({ transaction }) => {
       const { original } = transaction.mutations[0];
-      const { txid } = await api<{ txid: number }>(`/api/todos/${original.id}`, {
-        method: 'DELETE',
+      return submitCommand({
+        entity: 'todo',
+        op: 'delete',
+        payload: { id: original.id },
       });
-      return { txid };
     },
   }),
 );

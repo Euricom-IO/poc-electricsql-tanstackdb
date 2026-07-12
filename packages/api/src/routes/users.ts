@@ -1,11 +1,13 @@
 import { Hono } from 'hono';
-import { asc, eq } from 'drizzle-orm';
+import { asc } from 'drizzle-orm';
 import { db, users } from '@app/db';
 import type { Role } from '@app/db/types';
 import type { AppEnv } from '../auth';
 import { adminOnly, authMiddleware } from '../middleware/auth';
 import { toUser } from '../mappers';
 import { getTxid } from '../txid';
+import { applyUserInsert, applyUserUpdate, applyUserDelete } from '../services/users';
+import { ServiceError } from '../services/errors';
 
 export const userRoutes = new Hono<AppEnv>();
 
@@ -19,40 +21,25 @@ userRoutes.get('/', async (c) => {
 
 userRoutes.post('/', async (c) => {
   const body = await c.req.json<{ id?: string; name?: string; pin?: string; role?: Role }>();
-  const name = (body.name ?? '').trim();
-  const pin = String(body.pin ?? '');
-  const role: Role = body.role === 'admin' ? 'admin' : 'user';
-  if (!name || !pin) {
-    return c.json({ error: 'name and pin are required' }, 400);
-  }
-  const pinHash = await Bun.password.hash(pin);
   try {
     const { row, txid } = await db.transaction(async (tx) => {
       const txid = await getTxid(tx);
-      const [row] = await tx
-        .insert(users)
-        .values({ name, pinHash, role, ...(body.id ? { id: body.id } : {}) })
-        .returning();
-      return { row: row!, txid };
+      const row = await applyUserInsert(tx, body);
+      return { row, txid };
     });
     return c.json({ ...toUser(row), txid }, 201);
-  } catch {
-    return c.json({ error: 'A user with that name already exists' }, 409);
+  } catch (e) {
+    if (e instanceof ServiceError) return c.json({ error: e.message }, e.status);
+    throw e;
   }
 });
 
 userRoutes.patch('/:id', async (c) => {
   const id = c.req.param('id');
   const body = await c.req.json<{ name?: string; pin?: string; role?: Role }>();
-
-  const patch: Partial<{ name: string; role: Role; pinHash: string }> = {};
-  if (typeof body.name === 'string') patch.name = body.name.trim();
-  if (body.role === 'admin' || body.role === 'user') patch.role = body.role;
-  if (typeof body.pin === 'string' && body.pin) patch.pinHash = await Bun.password.hash(body.pin);
-
   const { row, txid } = await db.transaction(async (tx) => {
     const txid = await getTxid(tx);
-    const [row] = await tx.update(users).set(patch).where(eq(users.id, id)).returning();
+    const row = await applyUserUpdate(tx, { id, ...body });
     return { row, txid };
   });
   if (!row) {
@@ -63,16 +50,19 @@ userRoutes.patch('/:id', async (c) => {
 
 userRoutes.delete('/:id', async (c) => {
   const id = c.req.param('id');
-  if (id === c.get('user').id) {
-    return c.json({ error: 'You cannot delete your own account' }, 400);
+  const actor = c.get('user');
+  try {
+    const { row, txid } = await db.transaction(async (tx) => {
+      const txid = await getTxid(tx);
+      const row = await applyUserDelete(tx, actor, { id });
+      return { row, txid };
+    });
+    if (!row) {
+      return c.json({ error: 'User not found' }, 404);
+    }
+    return c.json({ ok: true, txid });
+  } catch (e) {
+    if (e instanceof ServiceError) return c.json({ error: e.message }, e.status);
+    throw e;
   }
-  const { row, txid } = await db.transaction(async (tx) => {
-    const txid = await getTxid(tx);
-    const [row] = await tx.delete(users).where(eq(users.id, id)).returning();
-    return { row, txid };
-  });
-  if (!row) {
-    return c.json({ error: 'User not found' }, 404);
-  }
-  return c.json({ ok: true, txid });
 });
