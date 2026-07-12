@@ -1,0 +1,26 @@
+{
+  "name": "poc-electricsql-tanstackdb",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "workspaces": ["packages/*"],
+  "scripts": {
+    "dev": "bun run --filter '@app/api' dev & bun run --filter '@app/web' dev",
+    "dev:api": "bun run --filter '@app/api' dev",
+    "dev:web": "bun run --filter '@app/web' dev",
+    "build": "bun run --filter '*' build",
+    "db:generate": "bun run --filter '@app/db' generate",
+    "db:migrate": "bun run --filter '@app/db' migrate",
+    "db:push": "bun run --filter '@app/db' push",
+    "db:seed": "bun run --filter '@app/db' seed",
+    "db:studio": "bun run --filter '@app/db' studio",
+    "db:up": "docker compose up -d",
+    "db:down": "docker compose down",
+    "lint": "vp lint",
+    "fmt": "vp fmt",
+    "check": "vp check"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.2"
+  }
+}

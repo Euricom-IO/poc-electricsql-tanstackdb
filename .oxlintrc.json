@@ -1,0 +1,13 @@
+{
+  "$schema": "https://raw.githubusercontent.com/oxc-project/oxc/main/npm/oxlint/configuration_schema.json",
+  "plugins": ["react", "typescript", "import"],
+  "env": {
+    "browser": true,
+    "es2024": true
+  },
+  "rules": {
+    "no-unused-vars": "warn",
+    "no-console": "off"
+  },
+  "ignorePatterns": ["dist", "build", "node_modules", "**/migrations/**"]
+}
