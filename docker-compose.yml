@@ -7,6 +7,8 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: todoapp
+    # wal_level=logical is required for ElectricSQL's logical replication.
+    command: ["postgres", "-c", "wal_level=logical"]
     ports:
       - "5432:5432"
     volumes:
@@ -16,3 +18,20 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
+
+  # ElectricSQL sync service: streams Postgres changes to clients over HTTP.
+  # The web2 app connects directly to this shape API (host port 3010).
+  electric:
+    image: electricsql/electric:latest
+    container_name: poc_todo_electric
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/todoapp
+      # POC only: disables auth and sends permissive CORS headers so the
+      # browser can talk to the sync layer directly.
+      ELECTRIC_INSECURE: "true"
+    ports:
+      - "3010:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy

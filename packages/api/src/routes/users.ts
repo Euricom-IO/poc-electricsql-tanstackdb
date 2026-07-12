@@ -5,6 +5,7 @@ import type { Role } from '@app/db/types';
 import type { AppEnv } from '../auth';
 import { adminOnly, authMiddleware } from '../middleware/auth';
 import { toUser } from '../mappers';
+import { getTxid } from '../txid';
 
 export const userRoutes = new Hono<AppEnv>();
 
@@ -26,11 +27,15 @@ userRoutes.post('/', async (c) => {
   }
   const pinHash = await Bun.password.hash(pin);
   try {
-    const [row] = await db
-      .insert(users)
-      .values({ name, pinHash, role, ...(body.id ? { id: body.id } : {}) })
-      .returning();
-    return c.json(toUser(row!), 201);
+    const { row, txid } = await db.transaction(async (tx) => {
+      const txid = await getTxid(tx);
+      const [row] = await tx
+        .insert(users)
+        .values({ name, pinHash, role, ...(body.id ? { id: body.id } : {}) })
+        .returning();
+      return { row: row!, txid };
+    });
+    return c.json({ ...toUser(row), txid }, 201);
   } catch {
     return c.json({ error: 'A user with that name already exists' }, 409);
   }
@@ -45,11 +50,15 @@ userRoutes.patch('/:id', async (c) => {
   if (body.role === 'admin' || body.role === 'user') patch.role = body.role;
   if (typeof body.pin === 'string' && body.pin) patch.pinHash = await Bun.password.hash(body.pin);
 
-  const [row] = await db.update(users).set(patch).where(eq(users.id, id)).returning();
+  const { row, txid } = await db.transaction(async (tx) => {
+    const txid = await getTxid(tx);
+    const [row] = await tx.update(users).set(patch).where(eq(users.id, id)).returning();
+    return { row, txid };
+  });
   if (!row) {
     return c.json({ error: 'User not found' }, 404);
   }
-  return c.json(toUser(row));
+  return c.json({ ...toUser(row), txid });
 });
 
 userRoutes.delete('/:id', async (c) => {
@@ -57,9 +66,13 @@ userRoutes.delete('/:id', async (c) => {
   if (id === c.get('user').id) {
     return c.json({ error: 'You cannot delete your own account' }, 400);
   }
-  const [row] = await db.delete(users).where(eq(users.id, id)).returning();
+  const { row, txid } = await db.transaction(async (tx) => {
+    const txid = await getTxid(tx);
+    const [row] = await tx.delete(users).where(eq(users.id, id)).returning();
+    return { row, txid };
+  });
   if (!row) {
     return c.json({ error: 'User not found' }, 404);
   }
-  return c.json({ ok: true });
+  return c.json({ ok: true, txid });
 });

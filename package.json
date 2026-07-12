@@ -6,8 +6,10 @@
   "workspaces": ["packages/*"],
   "scripts": {
     "dev": "bun run --filter '@app/api' dev & bun run --filter '@app/web' dev",
+    "dev2": "bun run --filter '@app/api' dev & bun run --filter '@app/web2' dev",
     "dev:api": "bun run --filter '@app/api' dev",
     "dev:web": "bun run --filter '@app/web' dev",
+    "dev:web2": "bun run --filter '@app/web2' dev",
     "build": "bun run --filter '*' build",
     "db:generate": "bun run --filter '@app/db' generate",
     "db:migrate": "bun run --filter '@app/db' migrate",
