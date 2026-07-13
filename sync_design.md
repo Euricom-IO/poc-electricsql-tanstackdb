@@ -1016,6 +1016,77 @@ The full sync path looks like this.
 
 This flow is more complex than a naive POST-and-retry design, but it is what makes the system safe under half-connections, app restarts, and duplicated network delivery.[cite:34][cite:75]
 
+### Command sync — without an attachment
+
+The base path: a command is stored locally, applied optimistically, sent, deduped and decided on the server, and finalized from a durable receipt. The `alt` branch shows the ambiguous-transport case resolved by a status probe rather than a blind resend.[cite:34][cite:56][cite:83]
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor User
+    participant App as App (client)
+    participant IDB as IndexedDB queue
+    participant API as POST /api/events
+    participant DB as Inbox + decisions
+
+    User->>App: action (create / update)
+    App->>IDB: store command (pending)
+    App-->>User: optimistic state
+
+    App->>API: POST envelope (Idempotency-Key, X-Event-Id)
+    API->>DB: dedupe by eventId, run handler in txn
+    DB-->>API: durable decision (accept / reject)
+    API-->>App: 200 accepted / 409 rejected
+    App->>IDB: record receipt → accepted / rejected / conflict
+    App-->>User: finalized state
+
+    Note over App,API: transport breaks before the response arrives
+    alt timeout or broken response
+        App->>IDB: mark unknown
+        App->>API: GET /api/events/:eventId/status
+        API-->>App: authoritative decision (or 404 = never seen)
+        App->>IDB: finalize from receipt (or re-queue)
+    end
+```
+
+### Command sync — with an attachment
+
+The same command, plus the upload-first prologue: bytes are hashed and `PUT` to their own channel, the command is gated until the blob is `uploaded`, and a server precondition returns a *transient* `425` (no receipt) if the bytes are not yet visible. Everything after the precondition is identical to the base path.[cite:34][cite:75][cite:83]
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor User
+    participant App as App (client)
+    participant IDB as IndexedDB (blob + command)
+    participant Att as PUT /api/attachments
+    participant OS as Object storage
+    participant API as POST /api/events
+    participant DB as Inbox + decisions
+
+    User->>App: action + file
+    App->>App: hash bytes → contentHash
+    App->>IDB: store blob (pending) + command (pending)
+    App-->>User: optimistic preview (objectURL)
+
+    Note over App,OS: bytes go FIRST (idempotent, content-addressed)
+    App->>Att: PUT /api/attachments/:id (X-Content-Hash)
+    Att->>OS: verify hash, dedupe, store
+    Att-->>App: 201 {storageKey} → blob "uploaded"
+
+    Note over App,API: command gated until blob is uploaded
+    App->>API: POST envelope (+ attachment ref)
+    alt bytes not visible yet (race)
+        API-->>App: 425 attachment_pending (no receipt)
+        App->>API: retry later
+    end
+    API->>DB: precondition ok → handler inserts row (idempotent)
+    DB-->>API: durable decision (accepted)
+    API-->>App: 200 accepted
+    App->>IDB: record receipt
+    App-->>User: swap preview for /api/blob/:contentHash
+```
+
 ## Why each pattern is needed
 
 ### Durable client queue
