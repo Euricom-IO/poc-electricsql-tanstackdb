@@ -1022,6 +1022,502 @@ In many systems, conflicts are handled by one of these policies:
 
 The sync engine should not hard-code the policy, but it should make the conflict visible as a first-class outcome.[cite:31][cite:34]
 
+## Attachments
+
+Some commands carry a single file or picture — a receipt photo, a signature, a scanned document. Binary payloads do not belong inside the JSON event envelope: they are large, they make every retry re-send megabytes, and they cannot participate in the JSON transactional dedupe path. The robust pattern is to treat an attachment as a **separate, content-addressed resource** that is uploaded on its own channel and then *referenced* by the command that needs it.[cite:34][cite:69][cite:83]
+
+### Three concerns, split along the existing seam
+
+The same principle applies at the read side: Electric syncs **Postgres rows** over HTTP shapes, not blobs. Streaming binary through a `bytea` column and a shape bloats the replication stream, breaks row diffing, and blows up IndexedDB. So an attachment splits into three concerns, each on the channel already built for it — reads over Electric shapes (see [proxy.md](proxy.md)), writes over the event queue, bytes over dumb object storage.
+
+| Concern | Channel | Mechanism |
+|---|---|---|
+| Attachment **metadata** (id, owner, mime, size, `contentHash`, storage key) | Electric shape | syncs like `todos` today |
+| Attachment **bytes** | object storage + browser cache | separate HTTP `GET`, cached offline |
+| Attachment **upload while offline** | the event queue | a command references the blob; the blob is uploaded separately |
+
+The Electric-synced row is the source of truth for *"this attachment exists and belongs to X"*; the bytes live behind a content-addressed URL and are treated as **derived** — always re-fetchable from the row, never the source of truth.[cite:56][cite:60]
+
+### Principle: upload the blob first, reference it from the event
+
+An attachment is uploaded before the command that references it is flushed. The command envelope carries only a small descriptor (id, hash, content type, size). This decouples the two concerns:
+
+- A large, slow upload retrying under poor connectivity never blocks the small command, and vice versa.[cite:70][cite:75]
+- The server never records an `accepted` decision for a command whose bytes are missing.[cite:56][cite:61]
+- The binary path can use its own timeout and backoff budget without inflating the event POST.[cite:70][cite:111]
+
+### Principle: content addressing for idempotent, verifiable uploads
+
+The client hashes the bytes (SHA-256) before upload. The hash gives three properties at once:
+
+- **Idempotency** — re-uploading the same attachment is a no-op the server can recognize.[cite:83][cite:86]
+- **Server-side dedupe** — identical bytes from retries or multiple commands map to one stored object.[cite:56][cite:60]
+- **Integrity** — the server verifies received bytes against the declared hash and rejects corruption.[cite:83]
+
+As with `eventId`/`idempotencyKey`, identity is split: `attachmentId` (a stable UUID for *this logical attachment*) is the upload and reference key, while `contentHash` handles dedupe and integrity. Keeping them separate means two commands can reference the same bytes without colliding on identity.[cite:85][cite:96]
+
+### Attachment reference in the envelope
+
+The envelope gains one optional field. This pattern models a single attachment per command; the same shape generalizes to an array if a command ever needs several.
+
+```ts
+// shared/event-types.ts (additive)
+export type AttachmentRef = {
+  attachmentId: string;   // stable uuid for this attachment
+  contentHash: string;    // sha-256 hex of the bytes
+  contentType: string;    // e.g. "image/jpeg"
+  filename: string;
+  size: number;           // bytes
+};
+
+// EventEnvelope gains:
+//   attachment?: AttachmentRef | null;
+```
+
+### Local durable blob store
+
+The bytes are stored in IndexedDB alongside the event queue so they survive refresh, crash, and backgrounding exactly like queued events.[cite:42][cite:46] The attachment record has its own upload state machine, mirroring the event lifecycle so ambiguity is handled the same way.[cite:34][cite:75]
+
+```ts
+// client/src/engine/db.ts (additive)
+export type LocalAttachmentRecord = {
+  attachmentId: string;
+  eventId: string;              // owning command
+  contentHash: string;
+  contentType: string;
+  filename: string;
+  size: number;
+  blob: Blob;                   // durable local bytes
+  uploadState:
+    | 'pending'
+    | 'uploading'
+    | 'uploaded'
+    | 'unknown'
+    | 'retry_wait'
+    | 'dead_letter';
+  attempts: number;
+  nextAttemptAt: string | null;
+  leaseOwner: string | null;
+  leaseExpiresAt: string | null;
+  lastErrorCode: string | null;
+  lastHttpStatus: number | null;
+  serverStorageKey?: string | null;
+};
+
+// bump the Dexie schema and reference the attachment from the event index
+this.version(2).stores({
+  events: 'eventId, syncState, streamType, streamId, issuedAt, nextAttemptAt, attachmentId',
+  attachments: 'attachmentId, eventId, uploadState, contentHash, nextAttemptAt',
+});
+```
+
+### Creating an attachment
+
+Hashing happens once, at creation, and the descriptor is embedded in the command envelope. The bytes and the command are persisted together so a crash between the two cannot leave a dangling command from the app's perspective.[cite:42][cite:46][cite:83]
+
+```ts
+// client/src/engine/createAttachment.ts
+async function hashBlob(blob: Blob): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', await blob.arrayBuffer());
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+export async function attachFile(eventId: string, file: File): Promise<AttachmentRef> {
+  const attachmentId = crypto.randomUUID();
+  const contentHash = await hashBlob(file);
+
+  const ref: AttachmentRef = {
+    attachmentId,
+    contentHash,
+    contentType: file.type || 'application/octet-stream',
+    filename: file.name,
+    size: file.size,
+  };
+
+  await appDb.attachments.put({
+    ...ref,
+    eventId,
+    blob: file,
+    uploadState: 'pending',
+    attempts: 0,
+    nextAttemptAt: null,
+    leaseOwner: null,
+    leaseExpiresAt: null,
+    lastErrorCode: null,
+    lastHttpStatus: null,
+    serverStorageKey: null,
+  });
+
+  return ref; // caller stores this on the event envelope before persisting the event
+}
+```
+
+The command is a normal envelope through the existing `createEvent` path — the attachment is just one more field on a domain event. Capturing a photo for a todo emits an `attachment.created` command and, in the same step, an optimistic preview from the local blob so the UI is never blank while the upload runs.[cite:31][cite:42]
+
+```ts
+// client/src/engine/attachments/capture.ts
+export async function captureAttachment(todoId: string, file: File, clientId: string) {
+  const eventId = crypto.randomUUID();
+  const ref = await attachFile(eventId, file);        // durable blob + descriptor
+
+  const event = createEvent({
+    streamId: todoId,
+    streamType: 'attachment',
+    eventType: 'attachment.created',
+    clientId,
+    payload: {
+      parentTodoId: todoId,
+      attachmentId: ref.attachmentId,
+      contentHash: ref.contentHash,
+      contentType: ref.contentType,
+      filename: ref.filename,
+      size: ref.size,
+    },
+  });
+
+  // the event index carries attachmentId so the flusher can gate on the upload
+  await appDb.events.put({ ...event, attachmentId: ref.attachmentId, syncState: 'pending', attempts: 0, /* …lease/error fields… */ });
+
+  const previewUrl = URL.createObjectURL(file); // optimistic; swapped for the cached URL once the row syncs back
+  return { eventId, previewUrl };
+}
+```
+
+A matching `attachment.deleted` command removes an attachment through the same queue; the handler tombstones the row (Electric replicates the removal) and marks the object for GC. Any command that owns a file follows this shape — the `attachment.*` command type is where the file-specific policy lives, while the engine stays generic.[cite:56][cite:69]
+
+### Uploading with resilience and ambiguity handling
+
+The upload worker reuses `resilientFetch` (timeout, backoff, jitter, circuit breaker) and the same leasing discipline as the event flusher.[cite:70][cite:71][cite:111] The upload is an idempotent `PUT` keyed by `attachmentId`; the declared hash travels in a header so the server can verify integrity and dedupe. After an ambiguous transport failure the worker does not assume failure — it probes the attachment status by id, exactly like the event `unknown` path.[cite:34][cite:75][cite:83]
+
+```ts
+// client/src/engine/uploadAttachments.ts
+export async function flushAttachmentQueue() {
+  const candidates = await appDb.attachments
+    .where('uploadState')
+    .anyOf('pending', 'retry_wait', 'unknown')
+    .toArray();
+
+  for (const att of candidates) {
+    if (att.nextAttemptAt && att.nextAttemptAt > isoNow()) continue;
+
+    const activeLease =
+      att.leaseExpiresAt && new Date(att.leaseExpiresAt).getTime() > Date.now();
+    if (activeLease && att.leaseOwner !== WORKER_ID) continue;
+
+    await appDb.attachments.update(att.attachmentId, {
+      uploadState: 'uploading',
+      leaseOwner: WORKER_ID,
+      leaseExpiresAt: futureIso(LEASE_MS),
+    });
+
+    try {
+      const res = await resilientFetch(`/api/attachments/${att.attachmentId}`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': att.contentType,
+          'X-Content-Hash': att.contentHash,
+          'X-Filename': encodeURIComponent(att.filename),
+        },
+        body: att.blob,
+        timeoutMs: 30_000,     // larger budget than an event POST
+        maxRetries: 1,
+      });
+
+      if (res.ok) {
+        const data = await res.json().catch(() => null);
+        await appDb.attachments.update(att.attachmentId, {
+          uploadState: 'uploaded',
+          leaseOwner: null,
+          leaseExpiresAt: null,
+          lastHttpStatus: res.status,
+          serverStorageKey: data?.storageKey ?? null,
+        });
+        continue;
+      }
+
+      if (res.status === 422) {
+        // integrity failure — the bytes will never match; do not retry blindly
+        await appDb.attachments.update(att.attachmentId, {
+          uploadState: 'dead_letter',
+          leaseOwner: null,
+          leaseExpiresAt: null,
+          lastHttpStatus: res.status,
+          lastErrorCode: 'hash_mismatch',
+        });
+        continue;
+      }
+
+      await appDb.attachments.update(att.attachmentId, {
+        uploadState: 'retry_wait',
+        leaseOwner: null,
+        leaseExpiresAt: null,
+        lastHttpStatus: res.status,
+        attempts: att.attempts + 1,
+        nextAttemptAt: futureIso(Math.min(60_000, 1000 * 2 ** Math.max(1, att.attempts))),
+      });
+    } catch (err) {
+      const classified = classifyTransportError(err);
+
+      if (classified.unknown) {
+        const probe = await probeAttachment(att.attachmentId);
+        if (probe.known && probe.complete) {
+          await appDb.attachments.update(att.attachmentId, {
+            uploadState: 'uploaded',
+            leaseOwner: null,
+            leaseExpiresAt: null,
+            serverStorageKey: probe.storageKey ?? null,
+          });
+          continue;
+        }
+      }
+
+      await appDb.attachments.update(att.attachmentId, {
+        uploadState: classified.unknown ? 'unknown' : 'retry_wait',
+        leaseOwner: null,
+        leaseExpiresAt: null,
+        attempts: att.attempts + 1,
+        lastErrorCode: classified.code,
+        nextAttemptAt: futureIso(Math.min(60_000, 1500 * 2 ** Math.max(1, att.attempts))),
+      });
+    }
+  }
+}
+
+async function probeAttachment(attachmentId: string) {
+  try {
+    const res = await resilientFetch(`/api/attachments/${attachmentId}/status`, {
+      method: 'GET',
+      timeoutMs: 5_000,
+      maxRetries: 0,
+    });
+    if (res.status === 404) return { known: false, complete: false } as const;
+    const data = await res.json();
+    return { known: true, complete: data.state === 'complete', storageKey: data.storageKey } as const;
+  } catch {
+    return { known: false, complete: false } as const;
+  }
+}
+```
+
+### Gating the command on its attachment
+
+A command that references an attachment must not be flushed until the bytes are durably on the server. Add one guard to the event flusher so an un-uploaded attachment defers the command instead of racing it.[cite:34][cite:83]
+
+```ts
+// client/src/engine/sync.ts — inside flushEventQueue, before sending the event
+if (event.attachmentId) {
+  const att = await appDb.attachments.get(event.attachmentId);
+  if (att?.uploadState === 'dead_letter') {
+    // the bytes can never be delivered — fail the command deterministically
+    await appDb.events.update(event.eventId, {
+      syncState: 'dead_letter',
+      lastErrorCode: 'attachment_failed',
+    });
+    continue;
+  }
+  if (att?.uploadState !== 'uploaded') {
+    continue; // defer: let the attachment worker finish first
+  }
+}
+```
+
+### Server storage and endpoints
+
+The server stores attachment metadata in its own table and the bytes in object storage (S3/GCS/MinIO) or a `bytea` column for small blobs. Metadata carries the upload state, the verified hash, and the storage key.[cite:56][cite:123] In production, prefer presigned upload URLs so bytes go directly to object storage and never transit the API server; the client then confirms completion by id. The direct-`PUT` endpoint shown here keeps the example self-contained while preserving the same idempotency and integrity guarantees.
+
+```ts
+// server/src/db/schema.ts (additive)
+export const attachments = pgTable(
+  'attachments',
+  {
+    attachmentId: uuid('attachment_id').primaryKey(),
+    contentHash: text('content_hash').notNull(),
+    contentType: text('content_type').notNull(),
+    filename: text('filename').notNull(),
+    size: integer('size').notNull(),
+    storageKey: text('storage_key'),
+    uploadState: text('upload_state').notNull(), // 'pending' | 'complete'
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull(),
+    completedAt: timestamp('completed_at', { withTimezone: true }),
+  },
+  (t) => ({
+    byHash: index('attachments_hash_idx').on(t.contentHash),
+  })
+);
+```
+
+The upload endpoint is idempotent, verifies integrity, and dedupes by content hash.[cite:56][cite:60][cite:83]
+
+```ts
+// server/src/app.ts (additive)
+app.put('/api/attachments/:id', async (c) => {
+  const attachmentId = c.req.param('id');
+  const declaredHash = c.req.header('X-Content-Hash');
+  if (!declaredHash) return c.json({ error: 'missing_hash' }, 400);
+
+  // idempotent replay: already stored with matching bytes
+  const existing = await db.query.attachments.findFirst({
+    where: eq(attachments.attachmentId, attachmentId),
+  });
+  if (existing?.uploadState === 'complete') {
+    if (existing.contentHash !== declaredHash) return c.json({ error: 'hash_conflict' }, 409);
+    return c.json({ attachmentId, storageKey: existing.storageKey }, 200);
+  }
+
+  const bytes = new Uint8Array(await c.req.arrayBuffer());
+  const actualHash = await sha256Hex(bytes);
+  if (actualHash !== declaredHash) {
+    return c.json({ error: 'hash_mismatch' }, 422); // integrity failure — client dead-letters
+  }
+
+  // dedupe: reuse storage if these exact bytes already exist
+  const twin = await db.query.attachments.findFirst({
+    where: eq(attachments.contentHash, actualHash),
+  });
+  const storageKey = twin?.storageKey ?? (await putObject(actualHash, bytes));
+
+  const now = new Date();
+  await db
+    .insert(attachments)
+    .values({
+      attachmentId,
+      contentHash: actualHash,
+      contentType: c.req.header('Content-Type') ?? 'application/octet-stream',
+      filename: decodeURIComponent(c.req.header('X-Filename') ?? ''),
+      size: bytes.byteLength,
+      storageKey,
+      uploadState: 'complete',
+      createdAt: now,
+      completedAt: now,
+    })
+    .onConflictDoUpdate({
+      target: attachments.attachmentId,
+      set: { uploadState: 'complete', storageKey, contentHash: actualHash, completedAt: now },
+    });
+
+  return c.json({ attachmentId, storageKey }, 201);
+});
+
+app.get('/api/attachments/:id/status', async (c) => {
+  const attachmentId = c.req.param('id');
+  const row = await db.query.attachments.findFirst({
+    where: eq(attachments.attachmentId, attachmentId),
+  });
+  if (!row) return c.json({ known: false }, 404);
+  return c.json({ known: true, state: row.uploadState, storageKey: row.storageKey });
+});
+```
+
+### The command's attachment precondition
+
+Upload-first plus client gating means the bytes are normally present by the time the command arrives. But replication lag, a client bug, or a status-probe race can still deliver a command whose attachment is not yet visible. The engine treats this as a **transient** condition, not a durable rejection: it returns `425 Too Early` with code `attachment_pending` and writes **no decision receipt**, so the client simply retries later. This is the one case where an event is refused without a durable outcome — recording a rejection here would permanently fail a command whose bytes are merely late.[cite:34][cite:56][cite:83]
+
+```ts
+// server/src/app.ts — inside POST /api/events, after envelope validation
+// and after the prior-decision replay check, before running the handler.
+if (envelope.attachment) {
+  const att = await db.query.attachments.findFirst({
+    where: eq(attachments.attachmentId, envelope.attachment.attachmentId),
+  });
+  const ready =
+    att?.uploadState === 'complete' && att.contentHash === envelope.attachment.contentHash;
+  if (!ready) {
+    return c.json(
+      { eventId: envelope.eventId, code: 'attachment_pending', retryable: true },
+      425 // resilientFetch already treats 425 as retryable — no receipt written
+    );
+  }
+}
+```
+
+Because `425` is already in the retryable set in `resilientFetch`, this integrates without new client transport logic, and since no decision is stored the eventual retry runs the handler normally once the bytes are present.[cite:34][cite:75]
+
+### Handling `attachment.created`
+
+The precondition above guarantees the bytes exist before the handler runs, so the handler only has to confirm integrity and write the metadata row. Writing that row into Postgres is what makes the attachment real: Electric replicates it back to *every* device the user has, and the optimistic `objectURL` preview is swapped for the cached, content-addressed URL once the row arrives.[cite:56][cite:61]
+
+```ts
+// server/src/handlers/attachment.ts
+export const attachmentCreated: EventHandler = async (event) => {
+  const { attachmentId, contentHash, parentTodoId, contentType, filename, size } = event.payload as any;
+
+  const blob = await db.query.attachments.findFirst({
+    where: eq(attachments.attachmentId, attachmentId),
+  });
+  // precondition already ran, but re-check keeps the handler self-contained
+  if (blob?.uploadState !== 'complete' || blob.contentHash !== contentHash) {
+    return { decision: 'rejected', code: 'attachment_missing', reason: 'blob not stored' };
+  }
+
+  // the row Electric will replicate to all of the user's devices
+  await db.insert(attachmentRows).values({
+    id: attachmentId,
+    userId: event.clientId,      // or the actor id resolved from auth
+    parentTodoId,
+    storageKey: blob.storageKey!,
+    contentHash,
+    mime: contentType,
+    byteSize: size,
+    filename,
+    createdAt: new Date(),
+  }).onConflictDoNothing();       // idempotent: replay lands the same row once
+
+  return { decision: 'accepted', result: { attachmentId, storageKey: blob.storageKey } };
+};
+
+// register it alongside the generic '*' handler
+handlerRegistry['attachment:attachment.created'] = attachmentCreated;
+```
+
+The insert is idempotent (`onConflictDoNothing` on the attachment id), so an at-least-once retry that re-runs the handler produces exactly one row — the same guarantee the inbox gives the transport layer.[cite:56][cite:60][cite:83]
+
+### Read path: metadata by shape, bytes by cache
+
+Metadata rides an Electric shape, declared with one entry in the proxy's `SHAPES` table (see [proxy.md](proxy.md)) so it is authenticated and scoped per user exactly like `todos`:
+
+```ts
+// packages/api/src/routes/shape.ts — one more entry in SHAPES
+attachments: { table: 'attachments', scope: 'user_id', authz: 'user' },
+```
+
+The row gives the client `storageKey` → a URL. Bytes come from that URL and are cached by a **Service Worker using the Cache Storage API** — purpose-built for `Request`/`Response` pairs and streams, and the right tool here rather than IndexedDB. Make the URL **content-addressed and immutable** (`storageKey` = `contentHash`, served with `Cache-Control: immutable`) so cache-first is always correct: a changed image is a new key, never a stale hit.
+
+```js
+// sw.js — cache-first for immutable blob bytes
+self.addEventListener('fetch', (e) => {
+  const url = new URL(e.request.url);
+  if (!url.pathname.startsWith('/api/blob/')) return;
+  e.respondWith(
+    caches.open('att-v1').then(async (cache) => {
+      const hit = await cache.match(e.request);
+      if (hit) return hit;                     // offline-friendly
+      const res = await fetch(e.request);
+      if (res.ok) cache.put(e.request, res.clone());
+      return res;
+    }),
+  );
+});
+```
+
+Because metadata arrives *before* the bytes are needed, the client can **prefetch on sync**: when a new `attachments` row appears in the collection, `fetch()` its URL so the Service Worker warms the cache before the user goes offline — the payoff of separating metadata from bytes. Bound it (LRU eviction, size cap, prefetch thumbnails only, respect `navigator.connection.saveData`).[cite:42][cite:46]
+
+### Lifecycle, cleanup, and garbage collection
+
+- Once the owning command reaches `accepted`, the client may drop the local `Blob` to reclaim space while keeping the `AttachmentRef` metadata; if the file is needed for display again it is fetched from the server.[cite:42]
+- The server should garbage-collect attachments that were uploaded but never referenced by an `accepted` decision after a TTL, so abandoned uploads do not accumulate.[cite:142][cite:148]
+- Because storage is content-addressed and deduped, deleting an object requires first checking that no other attachment row references the same `contentHash`.[cite:60]
+- A blob can upload while its command is later rejected or dead-lettered, or a command can be accepted against a blob that was GC'd early. Reconcile both ways: server-side, sweep object-storage keys with no `attachments` row; client-side, drop `pending_blobs` once the row syncs back through the shape.[cite:34][cite:56]
+
+### Things worth deciding early
+
+- **Big files and resumability.** `resilientFetch` retries whole requests, so a multi-MB image re-sends every byte on each retry over a flaky link. For large originals, add chunked or presigned-multipart upload instead. Splitting **thumbnails** (small, cheap to prefetch) from **originals** (large, fetched on demand) is often worth it.[cite:70][cite:75]
+- **Where the blob URL points.** A same-origin proxy (`/api/blob/:key`, authorized with the same JWT as the shape routes) is simplest and keeps the Service Worker cache key stable. Presigned S3/R2 URLs offload bandwidth but their signature expiry makes them poor cache keys — cache the *bytes* under the stable content-addressed key, never under a signed URL.
+- **Cache eviction and quota.** Cache Storage can be evicted under storage pressure. Because the cache is derived from the metadata row it is always re-fetchable, so eviction is safe; call `navigator.storage.persist()` when offline images are critical.[cite:42]
+
+### Why this stays robust
+
+The attachment path inherits every guarantee of the event path rather than reinventing it: durable local storage, a state machine with an explicit `unknown`, leasing against concurrent workers, resilient transport, idempotent server writes, and status probing for ambiguous outcomes. The only genuinely new ideas are content addressing (for integrity and dedupe) and upload-first ordering (so a command is never accepted against missing bytes).[cite:34][cite:56][cite:75][cite:83]
+
 ## Observability and support
 
 Recommended metrics and operational views:
@@ -1056,6 +1552,7 @@ A strong starting point for a production implementation is:
 - Drizzle/Postgres inbox and decision tables.[cite:54][cite:56]
 - Explicit timeout, backoff, jitter, and circuit breaker logic.[cite:70][cite:71][cite:111]
 - `/api/events/:eventId/status` endpoint for ambiguous outcome reconciliation.[cite:34][cite:83]
+- Content-addressed, upload-first attachments on their own resilient channel, referenced by command and reconciled via `/api/attachments/:id/status`.[cite:34][cite:83]
 - Minimal but useful `event_processing_log` with later partitioning if growth justifies it.[cite:123][cite:142]
 
 This gives a system that is resilient under offline operation, poor connectivity, partial failures, retries, and duplicate delivery, while keeping business semantics separate from transport semantics.[cite:31][cite:34][cite:75]
