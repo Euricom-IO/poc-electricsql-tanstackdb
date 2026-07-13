@@ -139,6 +139,8 @@ export const appDb = new EngineDb();
 
 Lease fields such as `leaseOwner` and `leaseExpiresAt` prevent multiple tabs, workers, or overlapping loops from processing the same pending event at the same time. Without leasing, concurrent flushers can cause duplicate sends and confusing local state transitions even if the server-side dedupe remains correct.[cite:34][cite:46]
 
+`leaseOwner` holds a `SYNC_INSTANCE_ID` — a UUID minted once per execution context (tab or worker) at module load, so each context is a distinct owner. Lease expiry handles contention between *live* instances, but it does not by itself recover a record that a crash or app recycle left mid-flight in `sending`/`uploading`: those states are not re-selected by the flush query. See [Recovery after recycle or restart](#recovery-after-recycle-or-restart).[cite:34]
+
 ### Client event lifecycle
 
 The client should treat sync as a state machine instead of a boolean “synced/unsynced” model.[cite:34][cite:74]
@@ -366,7 +368,7 @@ The queue worker sends eligible events, updates local state, and probes the serv
 import { appDb } from './db';
 import { resilientFetch, TimeoutError, CircuitOpenError } from './network';
 
-const WORKER_ID = crypto.randomUUID();
+const SYNC_INSTANCE_ID = crypto.randomUUID(); // one per tab / worker, regenerated on reload
 const LEASE_MS = 20_000;
 
 function isoNow() {
@@ -415,11 +417,11 @@ export async function flushEventQueue() {
     const activeLease =
       event.leaseExpiresAt && new Date(event.leaseExpiresAt).getTime() > Date.now();
 
-    if (activeLease && event.leaseOwner !== WORKER_ID) continue;
+    if (activeLease && event.leaseOwner !== SYNC_INSTANCE_ID) continue;
 
     await appDb.events.update(event.eventId, {
       syncState: 'sending',
-      leaseOwner: WORKER_ID,
+      leaseOwner: SYNC_INSTANCE_ID,
       leaseExpiresAt: futureIso(LEASE_MS),
       lastAttemptAt: isoNow(),
       lastErrorCode: null,
@@ -579,6 +581,49 @@ export async function flushEventQueue() {
   }
 }
 ```
+
+## Recovery after recycle or restart
+
+A client can be recycled at any moment — a browser reload, a killed and relaunched process, a mobile WebView torn down in the background, or a crashed tab. Durable data survives (the queue and blobs live in IndexedDB), but two things need care after a recycle.[cite:42][cite:46]
+
+First, `SYNC_INSTANCE_ID` is regenerated on load, so the relaunched app is a *different* lease owner than the instance that died. Any record the dead instance was processing still carries its `leaseOwner` and a possibly-unexpired `leaseExpiresAt`.[cite:34]
+
+Second, and more importantly, a record caught **mid-flight** is frozen in a transient state — a command in `sending`, a blob in `uploading`. The flush query only re-selects `pending`, `retry_wait`, and `unknown`, so an in-flight record is **not** picked up again on its own. Lease expiry alone does not rescue it, because expiry only governs *eligibility among live owners*, not re-selection of a stuck state. Without a recovery step, such a record is stranded forever.[cite:34][cite:75]
+
+The fix is a startup sweep that runs once before the normal flush loop. It requeues in-flight records whose lease has expired — so it never steals work from a still-live sibling tab — and moves them to `unknown` rather than `pending`.[cite:34][cite:75][cite:83]
+
+```ts
+// client/src/engine/recover.ts — run once on app start, before flushing
+export async function recoverInFlight() {
+  const now = isoNow();
+
+  const stuckEvents = await appDb.events.where('syncState').equals('sending').toArray();
+  for (const e of stuckEvents) {
+    if (e.leaseExpiresAt && e.leaseExpiresAt > now) continue; // a live tab may still own it
+    await appDb.events.update(e.eventId, {
+      syncState: 'unknown',          // outcome is genuinely ambiguous — probe, don't blind-resend
+      leaseOwner: null,
+      leaseExpiresAt: null,
+      nextAttemptAt: null,
+    });
+  }
+
+  const stuckBlobs = await appDb.attachments.where('uploadState').equals('uploading').toArray();
+  for (const a of stuckBlobs) {
+    if (a.leaseExpiresAt && a.leaseExpiresAt > now) continue;
+    await appDb.attachments.update(a.attachmentId, {
+      uploadState: 'unknown',        // probe /status before re-PUTting a large blob
+      leaseOwner: null,
+      leaseExpiresAt: null,
+      nextAttemptAt: null,
+    });
+  }
+}
+```
+
+Recovering to `unknown` — not `pending` — is the important detail. When the app died mid-send, whether the server received the request is genuinely unknown, which is exactly what the `unknown` state models. Routing the record there makes the flush loop **probe `/status` first** (`/api/events/:eventId/status`, `/api/attachments/:id/status`) instead of blindly re-sending, which avoids a redundant multi-megabyte re-upload and a duplicate side effect.[cite:34][cite:75][cite:83] Even in the worst case a re-send is safe, because the server's inbox and `contentHash` dedupe make replays idempotent — so recovery can never corrupt state, it only decides how efficiently the record is resolved.[cite:56][cite:60][cite:83]
+
+The lease `leaseExpiresAt > now` guard means a record recycled within the last `LEASE_MS` waits out the remainder of its lease before recovery reclaims it. This bounded stall is deliberate: it is the same rule that stops one live tab from stealing another live tab's in-flight record, since neither can tell a crashed owner from a slow one by id alone.[cite:34][cite:46]
 
 ## Server architecture
 
@@ -1202,11 +1247,11 @@ export async function flushAttachmentQueue() {
 
     const activeLease =
       att.leaseExpiresAt && new Date(att.leaseExpiresAt).getTime() > Date.now();
-    if (activeLease && att.leaseOwner !== WORKER_ID) continue;
+    if (activeLease && att.leaseOwner !== SYNC_INSTANCE_ID) continue;
 
     await appDb.attachments.update(att.attachmentId, {
       uploadState: 'uploading',
-      leaseOwner: WORKER_ID,
+      leaseOwner: SYNC_INSTANCE_ID,
       leaseExpiresAt: futureIso(LEASE_MS),
     });
 
@@ -1500,6 +1545,76 @@ self.addEventListener('fetch', (e) => {
 ```
 
 Because metadata arrives *before* the bytes are needed, the client can **prefetch on sync**: when a new `attachments` row appears in the collection, `fetch()` its URL so the Service Worker warms the cache before the user goes offline — the payoff of separating metadata from bytes. Bound it (LRU eviction, size cap, prefetch thumbnails only, respect `navigator.connection.saveData`).[cite:42][cite:46]
+
+### End-to-end attachment flow
+
+The pieces above compose into one path. The invariant to hold onto is that the **bytes and the command are two durable artifacts, and the bytes always go first** — so the server never records a decision for a command whose file is missing.[cite:34][cite:56][cite:83]
+
+1. **Capture (client, possibly offline).** Hash the bytes → `contentHash`, store the `Blob` durably (`uploadState: 'pending'`), and emit an `attachment.created` command through the normal `createEvent` path with the descriptor in its payload. Show `URL.createObjectURL(file)` as an optimistic preview so the UI is never blank. Two queued artifacts now exist: a blob and a command.[cite:31][cite:42][cite:46]
+2. **Upload the bytes first.** `flushAttachmentQueue` leases the blob and issues an idempotent `PUT /api/attachments/:id` (hash in `X-Content-Hash`) over `resilientFetch` with a larger timeout budget. The server verifies the hash, dedupes by `contentHash`, stores the object, and returns the `storageKey`; the blob moves to `uploaded`. Re-`PUT`ting the same bytes is a no-op.[cite:70][cite:83]
+3. **Gate the command on the upload.** `flushEventQueue` will not send the command until its blob is `uploaded`: a `dead_letter` blob fails the command (`attachment_failed`), an un-`uploaded` blob simply defers it. This is the guarantee that the server never sees the command before the bytes exist.[cite:34][cite:83]
+4. **Server precondition (race safety net).** Inside `POST /api/events`, if the referenced attachment is not yet `complete`, the engine returns `425 Too Early` (`attachment_pending`) and writes **no decision receipt**, so the client retries later instead of failing permanently.[cite:34][cite:75]
+5. **Handler lands the row.** `attachmentCreated` re-checks the blob, inserts the `attachments` Postgres row (`onConflictDoNothing`, idempotent), and returns `accepted`, which is stored as a durable receipt. Inserting the row is what makes the attachment real.[cite:56][cite:60][cite:61]
+6. **Electric replicates it back.** The new row flows out through the authenticated shape to all of the user's devices. On the originating device the optimistic `objectURL` is swapped for the content-addressed `/api/blob/:contentHash` URL; other devices can prefetch the bytes as soon as the metadata row arrives.[cite:56]
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor User
+    participant App as App (this device)
+    participant IDB as IndexedDB
+    participant Att as PUT /api/attachments
+    participant OS as Object storage
+    participant Ev as POST /api/events
+    participant PG as Postgres
+    participant EL as Electric shape
+    participant Dev2 as Other devices
+
+    User->>App: capture file
+    App->>App: hash bytes → contentHash
+    App->>IDB: store blob (pending) + attachment.created (pending)
+    App-->>User: optimistic preview (objectURL)
+
+    Note over App,OS: bytes go FIRST (idempotent, content-addressed)
+    App->>Att: PUT /api/attachments/:id (X-Content-Hash)
+    Att->>OS: verify hash, dedupe, store
+    Att-->>App: 201 {storageKey} → blob "uploaded"
+
+    Note over App,Ev: command gated until blob is uploaded
+    App->>Ev: POST attachment.created
+    alt bytes not visible yet (race)
+        Ev-->>App: 425 attachment_pending (no receipt)
+        App->>Ev: retry later
+    end
+    Ev->>PG: insert attachments row (onConflictDoNothing)
+    Ev-->>App: 200 accepted (durable receipt)
+
+    PG->>EL: row replicated
+    EL-->>App: row arrives → swap preview for /api/blob/:contentHash
+    EL-->>Dev2: row arrives → prefetch bytes into cache
+```
+
+Linear summary of the ordering:
+
+```
+capture → store blob + command locally (optimistic preview)
+        → upload bytes (idempotent, content-addressed)   ← MUST complete first
+        → POST command (gated on upload)
+        → server precondition (425 if bytes not visible yet)
+        → handler inserts row (idempotent) → durable receipt
+        → Electric replicates row back → preview swapped for cached URL
+```
+
+The failure branches reuse the event engine's machinery rather than adding a parallel one:[cite:34][cite:56][cite:75][cite:83]
+
+| Situation | What happens |
+|---|---|
+| Upload times out (ambiguous) | blob → `unknown`, then probe `/api/attachments/:id/status` — never assume failure |
+| Duplicate upload retry | server dedupes by `contentHash` → one object |
+| Duplicate command retry | prior decision replayed, or `onConflictDoNothing` → one row |
+| Command arrives before bytes | `425 attachment_pending`, retried, no permanent reject |
+| Corrupt bytes | `422` → blob `dead_letter` → command `dead_letter` |
+| Blob uploaded but command rejected/dead-lettered | orphan reconciliation sweeps keys with no row; client drops the local blob once the row syncs |
 
 ### Lifecycle, cleanup, and garbage collection
 
