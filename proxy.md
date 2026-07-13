@@ -58,41 +58,141 @@ Add to the API's environment:
 - `ELECTRIC_SECRET` (production) — sent to Electric so only the proxy can reach
   it once `ELECTRIC_INSECURE` is turned off.
 
-### 2. Shared proxy helper
+### 2. Role-aware auth middleware
 
-New file `packages/api/src/routes/shape.ts`. One helper does param filtering +
-streaming; per-shape config supplies table / where / columns / authz.
+Replace the separate `authMiddleware` + `adminOnly` pair with a single
+**factory** `authMiddleware(minRole?)` so a route declares its requirement in one
+call — e.g. `authMiddleware(cfg.authz)` in the shape loop below.
+
+Rewrite [`src/middleware/auth.ts`](packages/api/src/middleware/auth.ts):
+
+```ts
+import { createMiddleware } from 'hono/factory';
+import { verifyToken, type AppEnv, type AuthUser } from '../auth';
+import type { Role } from '@app/db/types';
+
+// Roles are a hierarchy: admin outranks user. A route asks for a MINIMUM role.
+const ROLE_RANK: Record<Role, number> = { user: 0, admin: 1 };
+
+/**
+ * Authenticate via Bearer JWT and enforce a minimum role.
+ *   authMiddleware()        → any valid token (was: bare `authMiddleware`)
+ *   authMiddleware('admin') → valid token AND admin (was: `authMiddleware, adminOnly`)
+ * `authMiddleware('user')` still admits admins, so scoping a shape to `'user'`
+ * never locks an admin out of their own rows.
+ */
+export function authMiddleware(minRole: Role = 'user') {
+  return createMiddleware<AppEnv>(async (c, next) => {
+    const header = c.req.header('Authorization');
+    if (!header?.startsWith('Bearer ')) {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+    let user: AuthUser;
+    try {
+      const payload = await verifyToken(header.slice(7));
+      user = { id: payload.sub, name: payload.name, role: payload.role };
+    } catch {
+      return c.json({ error: 'Invalid or expired token' }, 401);
+    }
+    if (ROLE_RANK[user.role] < ROLE_RANK[minRole]) {
+      return c.json({ error: `Forbidden: requires ${minRole}` }, 403);
+    }
+    c.set('user', user);
+    await next();
+  });
+}
+```
+
+**Migration ripple** — `authMiddleware` is now a factory, so every existing call
+site must call it. `adminOnly` is deleted.
+
+| File | Before | After |
+| ---- | ------ | ----- |
+| [`routes/events.ts`](packages/api/src/routes/events.ts) | `use('*', authMiddleware)` | `use('*', authMiddleware())` |
+| [`routes/todos.ts`](packages/api/src/routes/todos.ts) | `use('*', authMiddleware)` | `use('*', authMiddleware())` |
+| [`routes/auth.ts`](packages/api/src/routes/auth.ts) | `get('/me', authMiddleware, …)` | `get('/me', authMiddleware(), …)` |
+| [`routes/users.ts`](packages/api/src/routes/users.ts) | `use('*', authMiddleware, adminOnly)` | `use('*', authMiddleware('admin'))` |
+
+### 3. Shared proxy helper
+
+New file `packages/api/src/routes/shape.ts`. Shapes are declared in a single
+`SHAPES` table (`table` / `columns` / `scope` / `authz`); one helper filters
+params, streams, and **derives the per-user `where` + `params` automatically**
+from each shape's `scope` column. Routes are registered by iterating the table,
+so adding a shape is one config entry — no hand-written `where`/`params`.
 
 ```ts
 import { Hono } from 'hono';
 import { ELECTRIC_PROTOCOL_QUERY_PARAMS } from '@electric-sql/client';
-import type { AppEnv } from '../auth';
-import { authMiddleware, adminOnly } from '../middleware/auth';
+import type { AppEnv, AuthUser } from '../auth';
+import type { Role } from '@app/db/types';
+import { authMiddleware } from '../middleware/auth';
 
 export const shapeRoutes = new Hono<AppEnv>();
 
 const UPSTREAM = process.env.ELECTRIC_UPSTREAM_URL ?? 'http://localhost:3010/v1/shape';
 
 /**
- * Reverse-proxy a shape request to Electric. The client controls only Electric
- * protocol params (offset/handle/live/cursor/…); the caller pins everything
- * that governs *what* data is returned (table, where, columns, params).
+ * Declarative shape definitions. Each entry pins WHAT a shape exposes; the proxy
+ * derives the per-user filter from `scope` — no per-route `where`/`params`.
+ *
+ *  - `table`    reserved PG param, server-pinned.
+ *  - `columns`  optional column allowlist (omit → all columns).
+ *  - `scope`    column bound to the actor id as `where <scope> = $1`.
+ *               REQUIRED and explicit: a real column to scope per-user, or
+ *               `null` to declare a shape *intentionally* unscoped (every row).
+ *               There is no default, so a new shape cannot silently fail open.
+ *  - `authz`    minimum role, passed straight to `authMiddleware`. 'user' =
+ *               any authenticated actor (admins included); 'admin' = admin only.
  */
-async function proxyShape(
-  reqUrl: string,
-  pin: (u: URL) => void,
-): Promise<Response> {
+type ShapeConfig = {
+  table: string;
+  columns?: string[];
+  scope: string | null;
+  authz: Role;
+};
+
+const SHAPES = {
+  // Own todos only → where user_id = <actor.id>.
+  todos: { table: 'todos', scope: 'user_id', authz: 'user' },
+  // Admin-wide user list; pin_hash withheld via the column allowlist.
+  users: {
+    table: 'users',
+    columns: ['id', 'name', 'role', 'created_at'],
+    scope: null, // intentionally unscoped — admin sees all users
+    authz: 'admin',
+  },
+} satisfies Record<string, ShapeConfig>;
+
+/** Pin table/columns and, when scoped, BIND the actor id as a query param. */
+function pinShape(u: URL, cfg: ShapeConfig, actor: AuthUser): void {
+  u.searchParams.set('table', cfg.table);
+  if (cfg.columns) u.searchParams.set('columns', cfg.columns.join(','));
+  if (cfg.scope !== null) {
+    // `cfg.scope` is a server-side constant (never client input). The actor id
+    // is bound as a PARAMETER, never interpolated, so it can't alter the query.
+    u.searchParams.set('where', `${cfg.scope} = $1`);
+    u.searchParams.set('params[1]', actor.id);
+  }
+}
+
+/**
+ * Reverse-proxy a shape request to Electric. The client controls only Electric
+ * protocol params (offset/handle/live/cursor/…); table/columns/where/params are
+ * pinned from the server-side ShapeConfig.
+ */
+async function proxyShape(reqUrl: string, cfg: ShapeConfig, actor: AuthUser): Promise<Response> {
   const incoming = new URL(reqUrl);
   const upstream = new URL(UPSTREAM);
 
-  // Forward ONLY protocol params. table/where/columns/params are reserved PG
+  // Forward ONLY protocol params. table/columns/where/params are reserved PG
   // params and are never in this list, so a client cannot smuggle them in.
   for (const key of ELECTRIC_PROTOCOL_QUERY_PARAMS) {
     const v = incoming.searchParams.get(key);
     if (v !== null) upstream.searchParams.set(key, v);
   }
 
-  pin(upstream); // server-controlled table / where / columns / params
+  pinShape(upstream, cfg, actor); // server-controlled table / columns / where / params
 
   if (process.env.ELECTRIC_SECRET) {
     upstream.searchParams.set('secret', process.env.ELECTRIC_SECRET);
@@ -110,22 +210,13 @@ async function proxyShape(
   return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
 }
 
-shapeRoutes.get('/todos', authMiddleware, (c) => {
-  const actor = c.get('user');
-  return proxyShape(c.req.url, (u) => {
-    u.searchParams.set('table', 'todos');
-    u.searchParams.set('where', 'user_id = $1');
-    u.searchParams.set('params[1]', actor.id);
-  });
-});
-
-shapeRoutes.get('/users', authMiddleware, adminOnly, (c) =>
-  proxyShape(c.req.url, (u) => {
-    u.searchParams.set('table', 'users');
-    // Enforce the pin_hash exclusion server-side.
-    u.searchParams.set('columns', 'id,name,role,created_at');
-  }),
-);
+// One route per shape; the shape's `authz` is the minimum role. Scoping/authz
+// come from the config, so this loop never needs editing to add a shape.
+for (const [name, cfg] of Object.entries(SHAPES)) {
+  shapeRoutes.get(`/${name}`, authMiddleware(cfg.authz), (c) =>
+    proxyShape(c.req.url, cfg, c.get('user')),
+  );
+}
 ```
 
 Notes / gotchas:
@@ -139,8 +230,46 @@ Notes / gotchas:
   `ELECTRIC_SECRET`), not the end user.
 - **`ELECTRIC_PROTOCOL_QUERY_PARAMS`** is exported by `@electric-sql/client` —
   add it as an API dependency (authoritative), or inline the list.
+- **Composite / non-equality scopes** (team view, `org_id AND user_id`, ranges)
+  don't fit a single `scope` column. Keep `SHAPES` for the common case and add
+  an optional escape-hatch field — e.g. `pin?: (u, actor) => void` — for the
+  rare shape that needs a hand-written predicate, still param-bound.
 
-### 3. Mount the routes
+### 3a. Security review of automatic scoping
+
+**Verdict: safe to automate — and slightly safer than the hand-written version,
+provided `scope` stays required.** The automation only templatizes values that
+were *already* server-controlled; it changes none of the trust boundaries.
+
+Why it holds:
+
+- **No identifier injection.** The `where` column comes only from `cfg.scope`, a
+  constant in server code. It is never read from the request, headers, or JWT, so
+  a client cannot influence which column is filtered.
+- **No value injection.** `actor.id` is passed via `params[1]` and bound by
+  Postgres, exactly as today — never string-interpolated into the `where`. Even
+  if a `sub` claim contained SQL metacharacters it stays inert (and `sub` is a
+  server-issued UUID from a signed JWT anyway).
+- **Client still can't override the pins.** `table`/`columns`/`where`/`params`
+  are reserved PG params, absent from `ELECTRIC_PROTOCOL_QUERY_PARAMS`, and
+  `pinShape` runs *after* the forward loop — so a tampered
+  `?table=users&where=1=1` is overwritten, unchanged from the explicit design
+  (the tamper check in Verification still passes).
+
+The one risk the generic form *introduces* — and how it's neutralized:
+
+- **Fail-open by omission.** With per-route code, a missing `where` is visible in
+  the handler. In a config table, a forgotten `scope` on a future shape would
+  silently stream every row. This is neutralized by typing `scope: string | null`
+  with **no default**: every shape must state either a scope column or an
+  explicit `null` ("intentionally all rows"), so omission is a TypeScript error,
+  not a data leak. Treat any `scope: null` as a line that needs a reviewer's
+  sign-off (pair it with `authz: 'admin'` or a deliberate justification).
+
+No reason to keep it hand-written; adopt the config-driven form with the
+required-`scope` guard above.
+
+### 4. Mount the routes
 
 In [`src/index.ts`](packages/api/src/index.ts):
 
@@ -223,12 +352,13 @@ long-polls pass through unchanged. No change needed.
 
 1. Add `@electric-sql/client` to `packages/api` deps (for `ELECTRIC_PROTOCOL_QUERY_PARAMS`) or inline the constant.
 2. Add `ELECTRIC_UPSTREAM_URL` (+ `ELECTRIC_SECRET` for prod) to API env and `.env.example`.
-3. Create `packages/api/src/routes/shape.ts` (`proxyShape` helper + `/todos`, `/users` routes).
-4. Mount `app.route('/api/shape', shapeRoutes)` in `src/index.ts`.
-5. `web2`: replace `ELECTRIC_URL` with `SHAPE_URL` + `authHeaders`; wire `headers`/`onError` into both collections; keep `fetchClient`/`backoffOptions`.
-6. Remove the client `params.table` / `columns` (now server-pinned).
-7. Update `docker-compose.yml` for prod (secret + no public `3010`) — or note it as a follow-up if the POC stays insecure locally.
-8. Update `README.md` (web2 sync architecture + security note now reflect the authenticated proxy).
+3. Refactor `src/middleware/auth.ts` to the `authMiddleware(minRole?)` factory; delete `adminOnly`. Update the four call sites (`events.ts`, `todos.ts`, `auth.ts` → `authMiddleware()`; `users.ts` → `authMiddleware('admin')`).
+4. Create `packages/api/src/routes/shape.ts` — the `SHAPES` config table, `pinShape` (auto `where`/`params` from `scope`), the `proxyShape` helper, and the route-registration loop using `authMiddleware(cfg.authz)`.
+5. Mount `app.route('/api/shape', shapeRoutes)` in `src/index.ts`.
+6. `web2`: replace `ELECTRIC_URL` with `SHAPE_URL` + `authHeaders`; wire `headers`/`onError` into both collections; keep `fetchClient`/`backoffOptions`.
+7. Remove the client `params.table` / `columns` (now server-pinned).
+8. Update `docker-compose.yml` for prod (secret + no public `3010`) — or note it as a follow-up if the POC stays insecure locally.
+9. Update `README.md` (web2 sync architecture + security note now reflect the authenticated proxy).
 
 ## Verification
 
@@ -246,9 +376,10 @@ long-polls pass through unchanged. No change needed.
 
 ## Open decisions
 
-- **Todo scoping:** confirm `web2` should show only own todos (this plan) vs.
-  a shared/team view. If shared, replace the `where` with the appropriate
-  team/org predicate rather than dropping it.
+- **Todo scoping:** confirm `web2` should show only own todos (`scope: 'user_id'`)
+  vs. a shared/team view. If shared, this is where the `pin` escape hatch (§3)
+  earns its place — a team/org predicate rather than `scope: null` (which would
+  expose *all* todos).
 - **Constant source:** import `ELECTRIC_PROTOCOL_QUERY_PARAMS` (adds a client dep
   to the API) vs. inline a small allowlist (`offset`, `handle`, `live`, `cursor`,
   `source_id`, `replica`, live-cache-buster, log mode). Importing stays correct
