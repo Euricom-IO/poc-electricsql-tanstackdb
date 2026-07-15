@@ -1,6 +1,6 @@
 {
-  "id": "d1f39478-099d-47e1-98b6-4425ac463fb0",
-  "prevId": "db4e242a-a2dd-4005-9df0-a6126bba59ca",
+  "id": "018e43f9-4272-4d72-b0e0-bee310d249fb",
+  "prevId": "318ef14f-4c59-4193-9ad7-0c89c28013d1",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -51,15 +51,15 @@
         "processed_events_user_id_users_id_fk": {
           "name": "processed_events_user_id_users_id_fk",
           "tableFrom": "processed_events",
-          "tableTo": "users",
           "columnsFrom": [
             "user_id"
           ],
+          "tableTo": "users",
           "columnsTo": [
             "id"
           ],
-          "onDelete": "cascade",
-          "onUpdate": "no action"
+          "onUpdate": "no action",
+          "onDelete": "cascade"
         }
       },
       "compositePrimaryKeys": {},
@@ -111,15 +111,15 @@
         "todos_user_id_users_id_fk": {
           "name": "todos_user_id_users_id_fk",
           "tableFrom": "todos",
-          "tableTo": "users",
           "columnsFrom": [
             "user_id"
           ],
+          "tableTo": "users",
           "columnsTo": [
             "id"
           ],
-          "onDelete": "cascade",
-          "onUpdate": "no action"
+          "onUpdate": "no action",
+          "onDelete": "cascade"
         }
       },
       "compositePrimaryKeys": {},
@@ -173,10 +173,10 @@
       "uniqueConstraints": {
         "users_name_unique": {
           "name": "users_name_unique",
-          "nullsNotDistinct": false,
           "columns": [
             "name"
-          ]
+          ],
+          "nullsNotDistinct": false
         }
       },
       "policies": {},
@@ -195,10 +195,10 @@
     }
   },
   "schemas": {},
+  "views": {},
   "sequences": {},
   "roles": {},
   "policies": {},
-  "views": {},
   "_meta": {
     "columns": {},
     "schemas": {},

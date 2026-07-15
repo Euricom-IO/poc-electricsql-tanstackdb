@@ -6,6 +6,8 @@ import { authRoutes } from './routes/auth';
 import { todoRoutes } from './routes/todos';
 import { userRoutes } from './routes/users';
 import { eventRoutes } from './routes/events';
+import { dataRoutes } from './routes/data';
+import { powersyncRoutes } from './routes/powersync';
 
 const app = new Hono<AppEnv>();
 
@@ -21,6 +23,10 @@ app.route('/api/auth', authRoutes);
 app.route('/api/todos', todoRoutes);
 app.route('/api/users', userRoutes);
 app.route('/api/events', eventRoutes);
+// PowerSync upload endpoint (used by the web-powersync client).
+app.route('/api/data', dataRoutes);
+// PowerSync auth: mints short-lived sync tokens for the web-powersync client.
+app.route('/api/powersync', powersyncRoutes);
 
 const port = Number(process.env.API_PORT ?? 3000);
 console.log(`🚀 API listening on http://localhost:${port}`);

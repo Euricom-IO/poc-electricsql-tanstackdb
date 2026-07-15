@@ -35,3 +35,48 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+
+  # Dedicated Postgres for PowerSync's bucket storage. Kept separate from the
+  # app database so the sync engine's internal state never mixes with app data.
+  powersync-storage:
+    image: postgres:17-alpine
+    container_name: poc_todo_powersync_storage
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: powersync
+    volumes:
+      - ./.data-powersync:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d powersync"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # PowerSync self-hosted sync service. Replicates from the app Postgres and
+  # streams changes to clients over HTTP on host port 8080. Config and sync
+  # streams are mounted from ./powersync. Docs: https://docs.powersync.com/tools/local-development
+  powersync:
+    image: journeyapps/powersync-service:latest
+    container_name: poc_todo_powersync
+    restart: unless-stopped
+    command: ["start", "-r", "unified"]
+    environment:
+      POWERSYNC_CONFIG_PATH: /config/config.yaml
+      # Shared HS256 secret PowerSync verifies client tokens with. It is the
+      # app's JWT_SECRET, so tokens minted by GET /api/powersync/token (which
+      # signs with JWT_SECRET) validate here. Value is the base64url of the
+      # secret. Keep it in sync with JWT_SECRET; regenerate with:
+      #   printf '%s' '<JWT_SECRET>' | base64 | tr '+/' '-_' | tr -d '='
+      PS_JWK_K: ZGV2LXNlY3JldC1jaGFuZ2UtbWU  # base64url("dev-secret-change-me")
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./powersync/config.yaml:/config/config.yaml:ro
+      - ./powersync/sync-config.yaml:/config/sync-config.yaml:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      powersync-storage:
+        condition: service_healthy

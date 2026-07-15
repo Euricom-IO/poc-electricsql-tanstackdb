@@ -1,0 +1,20 @@
+# PowerSync sync streams for the local POC.
+# Docs: https://docs.powersync.com/sync/streams/overview#self-hosted
+#
+# Sync streams (edition 3) replace the legacy `bucket_definitions` sync rules.
+# Each stream is a named SELECT; `auto_subscribe: true` makes clients receive it
+# on connect without an explicit subscribe call.
+#
+# POC only: two global, unfiltered streams that sync every row of the app tables
+# to every client (no auth-scoped filtering). 
+config:
+  edition: 3
+
+streams:
+  todos:
+    auto_subscribe: true
+    query: SELECT * FROM todos
+
+  users:
+    auto_subscribe: true
+    query: SELECT * FROM users

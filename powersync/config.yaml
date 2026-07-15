@@ -1,0 +1,49 @@
+# PowerSync self-hosted service config for the local POC.
+# Docs: https://docs.powersync.com/tools/local-development
+#
+# Mounted read-only into the container at /config/config.yaml and selected via
+# POWERSYNC_CONFIG_PATH (see docker-compose.yml).
+
+# Source database to replicate from — the same Postgres the API/Electric use.
+replication:
+  connections:
+    - type: postgresql
+      uri: postgresql://postgres:postgres@postgres:5432/todoapp
+      # Local only: the container network is trusted, no TLS.
+      sslmode: disable
+
+# Bucket storage. Postgres storage (v1.3.8+) lets us stay in the Postgres
+# ecosystem and skip MongoDB. It lives in its own throwaway `powersync-storage`
+# database so it never mixes with the app's `todoapp` data.
+storage:
+  type: postgresql
+  uri: postgresql://postgres:postgres@powersync-storage:5432/powersync
+  sslmode: disable
+
+# HTTP API + sync endpoint. Exposed on host port 8080 (see docker-compose.yml).
+port: 8080
+
+# Sync streams definition (edition 3 — replaces the legacy sync rules).
+sync_config:
+  path: /config/sync-config.yaml
+
+# Client JWT verification (HS256 shared secret).
+#
+# Tokens are minted by the app's GET /api/powersync/token endpoint, signed with
+# JWT_SECRET. This key is that same secret (base64url), supplied via PS_JWK_K in
+# docker-compose.yml, so those tokens verify here. `kid`/`audience` must match
+# what the endpoint puts in the token (see packages/api/src/auth.ts).
+# Swap for an asymmetric jwks_uri before anything real.
+client_auth:
+  jwks:
+    keys:
+      - kty: oct
+        alg: HS256
+        kid: powersync
+        k: !env PS_JWK_K
+  audience: ['powersync']
+
+system:
+  logging:
+    level: info
+    format: text

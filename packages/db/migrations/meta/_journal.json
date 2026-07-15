@@ -5,15 +5,15 @@
     {
       "idx": 0,
       "version": "7",
-      "when": 1783845181005,
-      "tag": "0000_short_jackpot",
+      "when": 1784142281598,
+      "tag": "0000_init",
       "breakpoints": true
     },
     {
       "idx": 1,
       "version": "7",
-      "when": 1783858532315,
-      "tag": "0001_cooing_ronan",
+      "when": 1784142303407,
+      "tag": "0001_powersync_publication",
       "breakpoints": true
     }
   ]
